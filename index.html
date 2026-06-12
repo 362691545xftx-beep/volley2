@@ -4127,12 +4127,18 @@ function exportScoresXls() {
 // ============================================================
 // INIT
 // ============================================================
+window.addEventListener('error', function(e) {
+  console.error('[Global Error]', e.message, e.filename, e.lineno);
+});
+
 (async function init() {
-  await IDB.init();
-  Cloud.init();
+  try {
+    await IDB.init();
+  } catch(e) { console.warn('[IDB] init fallback:', e.message); }
+  try { Cloud.init(); } catch(e) { console.warn('[Cloud] init error:', e.message); }
   // 总是尝试初始化 Supabase（使用硬编码默认值或 localStorage 中的配置）
   if (Cloud._url && Cloud._key) {
-    initSupabase(Cloud._url, Cloud._key);
+    try { initSupabase(Cloud._url, Cloud._key); } catch(e) { console.warn('[Supabase] init error:', e.message); }
   }
   // 如果云端配置可用，自动同步
   if (Cloud.isConfigured()) {
@@ -4147,13 +4153,19 @@ function exportScoresXls() {
       }
     } catch(e) { console.warn('[Cloud] 初始拉取失败:', e.message); }
     // 2. 订阅 Realtime，实现多终端实时更新
-    Cloud.subscribe();
+    try { Cloud.subscribe(); } catch(e) { console.warn('[Cloud] subscribe error:', e.message); }
     // 3. 启动自动推送（管理员在后台操作时会自动推送到云端）
-    Cloud.autoPush();
+    try { Cloud.autoPush(); } catch(e) { console.warn('[Cloud] autoPush error:', e.message); }
   } else {
     console.log('[Cloud] 未检测到云端配置，以离线模式运行');
   }
-  switchMode('frontend');
+  // 始终渲染前端界面（即使上述步骤出错也不影响页面显示）
+  try { switchMode('frontend'); } catch(e) {
+    console.error('[Fatal] switchMode failed:', e);
+    // 最后的兜底：直接渲染标签页
+    var nav = document.getElementById('tabNav');
+    if (nav) nav.innerHTML = '<button class="tab-btn active" onclick="switchTab(\'fe-announce\')">赛事公告</button><button class="tab-btn" onclick="switchTab(\'fe-schedule\')">赛程安排</button><button class="tab-btn" onclick="switchTab(\'fe-scores\')">赛事成绩</button><button class="tab-btn" onclick="switchTab(\'fe-points\')">队伍积分</button><button class="tab-btn" onclick="switchTab(\'fe-photos\')">精彩照片</button><button class="tab-btn" onclick="switchTab(\'fe-register\')">队伍报名</button>';
+  }
 })();
 </script>
 </body>
