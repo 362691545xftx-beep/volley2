@@ -923,13 +923,19 @@ const Cloud = {
   },
 
   // Build request headers for Supabase REST API
+  // Note: sb_publishable_ keys are NOT JWTs, so skip Bearer token for non-JWT keys
   _headers() {
-    return {
+    const h = {
       'apikey': this._key,
-      'Authorization': 'Bearer ' + this._key,
       'Content-Type': 'application/json',
       'Prefer': 'return=representation'
     };
+    // Only add Bearer token if key looks like a JWT (eyJ prefix)
+    // sb_publishable_ / sb_secret_ keys use apikey header only
+    if (this._key && (this._key.startsWith('eyJ') || this._key.startsWith('sb_secret'))) {
+      h['Authorization'] = 'Bearer ' + this._key;
+    }
+    return h;
   },
 
   // Update sync status UI indicator
