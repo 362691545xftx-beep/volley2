@@ -588,6 +588,8 @@ const DB = {
     catch(e) { toast('存储空间不足，请清理照片数据', 'error'); }
     // Auto-sync to IndexedDB after every write
     IDB.sync();
+    // Auto-push to cloud (debounced)
+    Cloud.autoPush();
   },
   getTournaments() { return this.get('tournaments'); },
   saveTournaments(d) { this.set('tournaments', d); },
@@ -820,6 +822,166 @@ const IDB = {
       backupCount: backups.length,
       lastSync: localStorage.getItem('vb__lsSyncTime') || '-'
     };
+  }
+};
+
+// ============================================================
+// Cloud Sync Layer (Supabase REST API)
+// ============================================================
+const Cloud = {
+  _url: '',
+  _key: '',
+  _deviceId: '',
+  _pushTimer: null,
+  _enabled: false,
+
+  init() {
+    this._url = localStorage.getItem('vb_cloudUrl') || '';
+    this._key = localStorage.getItem('vb_cloudKey') || '';
+    this._deviceId = localStorage.getItem('vb_deviceId') || this._generateDeviceId();
+    this._enabled = !!(this._url && this._key);
+  },
+
+  _generateDeviceId() {
+    const id = 'dev_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+    localStorage.setItem('vb_deviceId', id);
+    return id;
+  },
+
+  isConfigured() {
+    return this._enabled;
+  },
+
+  getStatus() {
+    return {
+      configured: this._enabled,
+      url: this._url ? this._url.replace(/^(https?:\/\/[^\/]+).*$/, '$1') : '',
+      deviceId: this._deviceId,
+      lastPush: localStorage.getItem('vb_cloudLastPush') || '-',
+      lastPull: localStorage.getItem('vb_cloudLastPull') || '-'
+    };
+  },
+
+  configure(url, key) {
+    this._url = (url || '').trim().replace(/\/$/, '');
+    this._key = (key || '').trim();
+    this._enabled = !!(this._url && this._key);
+    localStorage.setItem('vb_cloudUrl', this._url);
+    localStorage.setItem('vb_cloudKey', this._key);
+    return this._enabled;
+  },
+
+  // Build request headers for Supabase REST API
+  _headers() {
+    return {
+      'apikey': this._key,
+      'Authorization': 'Bearer ' + this._key,
+      'Content-Type': 'application/json',
+      'Prefer': 'return=representation'
+    };
+  },
+
+  // Test connection to Supabase
+  async test() {
+    if (!this._enabled) return { ok: false, error: '未配置云端同步' };
+    try {
+      const resp = await fetch(this._url + '/rest/v1/app_data?select=id&limit=1', {
+        method: 'GET',
+        headers: this._headers()
+      });
+      if (resp.ok || resp.status === 406) {
+        return { ok: true };
+      }
+      const text = await resp.text();
+      return { ok: false, error: 'HTTP ' + resp.status + ': ' + text.slice(0, 200) };
+    } catch(e) {
+      return { ok: false, error: e.message };
+    }
+  },
+
+  // Push local data to cloud (upsert row id=1)
+  async push() {
+    if (!this._enabled) return false;
+    try {
+      const payload = {
+        id: 1,
+        data: {
+          tournaments: DB.getTournaments(),
+          registrations: DB.getRegistrations(),
+          schedules: DB.getSchedules(),
+          scores: DB.getScores(),
+          announcements: DB.getAnnouncements(),
+          photoFolders: DB.getPhotoFolders(),
+          adminPwd: DB.getAdminPassword()
+        },
+        updated_at: new Date().toISOString(),
+        device_id: this._deviceId
+      };
+      const resp = await fetch(this._url + '/rest/v1/app_data?id=eq.1', {
+        method: 'POST',
+        headers: { ...this._headers(), 'Prefer': 'resolution=merge-duplicates,return=representation' },
+        body: JSON.stringify(payload)
+      });
+      if (!resp.ok) {
+        // Try PATCH if POST failed (row already exists)
+        const patchResp = await fetch(this._url + '/rest/v1/app_data?id=eq.1', {
+          method: 'PATCH',
+          headers: this._headers(),
+          body: JSON.stringify({
+            data: payload.data,
+            updated_at: payload.updated_at,
+            device_id: this._deviceId
+          })
+        });
+        if (!patchResp.ok) {
+          const err = await patchResp.text();
+          throw new Error('Cloud push failed: ' + patchResp.status + ' ' + err.slice(0, 200));
+        }
+      }
+      localStorage.setItem('vb_cloudLastPush', new Date().toLocaleString());
+      console.log('[Cloud] Push success at', new Date().toLocaleString());
+      return true;
+    } catch(e) {
+      console.warn('[Cloud] Push error:', e.message);
+      return false;
+    }
+  },
+
+  // Pull data from cloud
+  async pull() {
+    if (!this._enabled) return null;
+    try {
+      const resp = await fetch(this._url + '/rest/v1/app_data?id=eq.1&select=*', {
+        method: 'GET',
+        headers: this._headers()
+      });
+      if (!resp.ok) {
+        throw new Error('Cloud pull failed: ' + resp.status);
+      }
+      const rows = await resp.json();
+      if (!rows || !rows.length || !rows[0].data) {
+        return null; // No cloud data yet
+      }
+      const cloudData = rows[0].data;
+      const cloudDevice = rows[0].device_id;
+      const cloudTime = rows[0].updated_at;
+      // Conflict detection: if cloud data was written by another device
+      const isConflict = cloudDevice && cloudDevice !== this._deviceId;
+      localStorage.setItem('vb_cloudLastPull', new Date().toLocaleString());
+      return { data: cloudData, conflict: isConflict, cloudTime };
+    } catch(e) {
+      console.warn('[Cloud] Pull error:', e.message);
+      return null;
+    }
+  },
+
+  // Auto-push after writes (debounced)
+  autoPush() {
+    if (!this._enabled) return;
+    clearTimeout(this._pushTimer);
+    this._pushTimer = setTimeout(() => {
+      this.push().catch(() => {});
+    }, 3000); // 3s debounce
   }
 };
 
@@ -3366,6 +3528,43 @@ function renderBE_Settings() {
   </div>`;
 
   html += `<div class="card">
+    <div class="card-title">☁️ 云端同步 <span style="font-size:12px;font-weight:400;color:var(--text-secondary)">(多设备数据同步)</span></div>
+    <div id="cloudStatus" style="margin:10px 0;font-size:13px;color:var(--text-secondary)">正在检测云端状态...</div>
+    <div style="margin-top:12px">
+      <details id="cloudConfigPanel">
+        <summary style="cursor:pointer;font-size:13px;color:var(--primary)">⚙️ 配置云端同步 (Supabase)</summary>
+        <div style="margin-top:10px;padding:10px;background:var(--bg);border-radius:var(--radius-sm)">
+          <div class="form-group" style="margin-bottom:8px">
+            <label class="form-label" style="font-size:12px">Supabase Project URL</label>
+            <input class="form-input" id="cloudUrl" placeholder="https://xxxxx.supabase.co" style="font-size:13px">
+          </div>
+          <div class="form-group" style="margin-bottom:8px">
+            <label class="form-label" style="font-size:12px">Supabase Anon Key</label>
+            <input class="form-input" id="cloudKey" placeholder="eyJhbGciOiJIUzI1NiIs..." style="font-size:13px">
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+            <button class="btn btn-primary" style="padding:6px 14px;font-size:12px" onclick="saveCloudConfig()">💾 保存配置</button>
+            <button class="btn btn-outline" style="padding:6px 14px;font-size:12px" onclick="testCloudConnection()">🔌 测试连接</button>
+          </div>
+          <div style="margin-top:10px;font-size:11px;color:var(--text-light);line-height:1.5">
+            <b>使用说明：</b><br>
+            1. 前往 <a href="https://supabase.com" target="_blank">supabase.com</a> 注册免费账号<br>
+            2. 新建 Project，在 Table Editor 创建表：<code style="background:#fff;padding:1px 4px;border-radius:3px">app_data</code><br>
+            3. 表结构：id(int), data(jsonb), updated_at(timestamptz), device_id(text)<br>
+            4. 在 Project Settings → API 获取 URL 和 Anon Key<br>
+            5. 填入上方并保存，即可实现手机与电脑数据同步
+          </div>
+        </div>
+      </details>
+      <div id="cloudActions" style="display:none;margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-primary" style="padding:6px 14px;font-size:12px" onclick="cloudPushNow()">⬆️ 推送数据到云端</button>
+        <button class="btn btn-outline" style="padding:6px 14px;font-size:12px" onclick="cloudPullNow()">⬇️ 从云端拉取数据</button>
+        <button class="btn btn-outline" style="padding:6px 14px;font-size:12px;color:var(--danger)" onclick="clearCloudConfig()">清除配置</button>
+      </div>
+    </div>
+  </div>`;
+
+  html += `<div class="card">
     <div class="card-title">🔑 修改管理密码</div>
     <div style="margin-top:14px">
       <div class="form-group"><label class="form-label">当前密码</label>
@@ -3378,7 +3577,7 @@ function renderBE_Settings() {
     </div>
   </div>`;
 
-  // Load db info and backup list asynchronously
+  // Load db info, backup list, and cloud status asynchronously
   setTimeout(async () => {
     try {
       const info = await IDB.getStorageInfo();
@@ -3391,6 +3590,7 @@ function renderBE_Settings() {
       document.getElementById('dbStatus').innerHTML = '<span style="color:var(--danger)">● 数据库未连接，仅使用本地缓存</span>';
     }
     await loadBackupList();
+    await loadCloudStatus();
   }, 100);
 
   return html;
@@ -3503,6 +3703,112 @@ async function deleteBackupRecord(id) {
     toast('备份已删除', 'success');
     await loadBackupList();
   } catch(e) { toast('删除失败: ' + e.message, 'error'); }
+}
+
+// ============================================================
+// CLOUD SYNC HELPERS
+// ============================================================
+async function loadCloudStatus() {
+  const statusEl = document.getElementById('cloudStatus');
+  const actionsEl = document.getElementById('cloudActions');
+  const configPanel = document.getElementById('cloudConfigPanel');
+  if (!statusEl) return;
+
+  const s = Cloud.getStatus();
+  if (!s.configured) {
+    statusEl.innerHTML = `<span style="color:var(--warning)">● 未配置云端同步</span> &nbsp;|&nbsp; 数据仅在当前设备保存`;
+    if (configPanel) configPanel.open = true;
+    if (actionsEl) actionsEl.style.display = 'none';
+    return;
+  }
+
+  if (configPanel) configPanel.open = false;
+  if (actionsEl) actionsEl.style.display = 'flex';
+
+  statusEl.innerHTML =
+    `<span style="color:var(--success)">● 云端已配置</span> &nbsp;|&nbsp; ` +
+    `服务器: ${s.url} &nbsp;|&nbsp; ` +
+    `设备ID: ${s.deviceId.slice(0, 12)}... &nbsp;|&nbsp; ` +
+    `上次推送: ${s.lastPush} &nbsp;|&nbsp; ` +
+    `上次拉取: ${s.lastPull}`;
+
+  // Pre-fill config inputs
+  const urlInput = document.getElementById('cloudUrl');
+  const keyInput = document.getElementById('cloudKey');
+  if (urlInput) urlInput.value = localStorage.getItem('vb_cloudUrl') || '';
+  if (keyInput) keyInput.value = localStorage.getItem('vb_cloudKey') || '';
+}
+
+function saveCloudConfig() {
+  const url = document.getElementById('cloudUrl').value.trim();
+  const key = document.getElementById('cloudKey').value.trim();
+  if (!url || !key) {
+    toast('请输入完整的 URL 和 Key', 'warning'); return;
+  }
+  Cloud.configure(url, key);
+  toast('云端配置已保存', 'success');
+  loadCloudStatus();
+}
+
+function clearCloudConfig() {
+  if (!confirm('确定清除云端同步配置？')) return;
+  Cloud.configure('', '');
+  toast('云端配置已清除', 'info');
+  loadCloudStatus();
+}
+
+async function testCloudConnection() {
+  const url = document.getElementById('cloudUrl').value.trim();
+  const key = document.getElementById('cloudKey').value.trim();
+  if (!url || !key) { toast('请先填写 URL 和 Key', 'warning'); return; }
+  // Temporarily set config for test
+  const oldUrl = Cloud._url, oldKey = Cloud._key;
+  Cloud.configure(url, key);
+  toast('正在测试连接...', 'info');
+  const result = await Cloud.test();
+  if (result.ok) {
+    toast('✅ 连接成功！可以保存配置并开始使用', 'success');
+  } else {
+    toast('❌ 连接失败: ' + result.error, 'error');
+  }
+  Cloud.configure(oldUrl, oldKey);
+}
+
+async function cloudPushNow() {
+  toast('正在推送数据到云端...', 'info');
+  const ok = await Cloud.push();
+  if (ok) {
+    toast('✅ 数据已推送至云端', 'success');
+    loadCloudStatus();
+  } else {
+    toast('❌ 推送失败，请检查网络或配置', 'error');
+  }
+}
+
+async function cloudPullNow() {
+  toast('正在从云端拉取数据...', 'info');
+  const result = await Cloud.pull();
+  if (!result) {
+    toast('云端暂无数据或拉取失败', 'warning');
+    return;
+  }
+  const d = result.data;
+  if (result.conflict) {
+    if (!confirm('⚠️ 云端数据来自其他设备，可能覆盖当前数据。\n\n云端最后更新: ' + new Date(result.cloudTime).toLocaleString() + '\n\n是否覆盖本地数据？')) return;
+  } else {
+    if (!confirm('即将用云端数据覆盖本地所有数据，是否继续？')) return;
+  }
+  // Apply cloud data
+  if (d.tournaments) DB.saveTournaments(d.tournaments);
+  if (d.registrations) DB.saveRegistrations(d.registrations);
+  if (d.schedules) DB.saveSchedules(d.schedules);
+  if (d.scores) DB.saveScores(d.scores);
+  if (d.announcements) DB.saveAnnouncements(d.announcements);
+  if (d.photoFolders) DB.savePhotoFolders(d.photoFolders);
+  if (d.adminPwd) DB.saveAdminPassword(d.adminPwd);
+  await IDB.syncNow();
+  toast('✅ 数据已从云端同步，正在刷新...', 'success');
+  setTimeout(() => { location.reload(); }, 600);
 }
 
 function exportAllData() {
@@ -3640,6 +3946,33 @@ function exportScoresXls() {
 // ============================================================
 (async function init() {
   await IDB.init();
+  Cloud.init();
+  // If cloud is configured, try to pull latest data (but don't block UI)
+  if (Cloud.isConfigured()) {
+    setTimeout(async () => {
+      try {
+        const result = await Cloud.pull();
+        if (result && result.data) {
+          const localHasData = DB.getTournaments().length > 0 || DB.getRegistrations().length > 0;
+          const cloudHasData = (result.data.tournaments||[]).length > 0 || (result.data.registrations||[]).length > 0;
+          if (cloudHasData && !localHasData) {
+            // Auto-apply cloud data if local is empty
+            const d = result.data;
+            if (d.tournaments) DB.saveTournaments(d.tournaments);
+            if (d.registrations) DB.saveRegistrations(d.registrations);
+            if (d.schedules) DB.saveSchedules(d.schedules);
+            if (d.scores) DB.saveScores(d.scores);
+            if (d.announcements) DB.saveAnnouncements(d.announcements);
+            if (d.photoFolders) DB.savePhotoFolders(d.photoFolders);
+            if (d.adminPwd) DB.saveAdminPassword(d.adminPwd);
+            await IDB.syncNow();
+            toast('已从云端自动同步数据', 'success');
+            renderCurrentTab();
+          }
+        }
+      } catch(e) { console.warn('[Cloud] Auto-pull skipped:', e.message); }
+    }, 2000);
+  }
   switchMode('frontend');
 })();
 </script>
