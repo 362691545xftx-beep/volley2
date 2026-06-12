@@ -586,6 +586,8 @@ const DB = {
   set(key, data) {
     try { localStorage.setItem(this._prefix + key, JSON.stringify(data)); }
     catch(e) { toast('存储空间不足，请清理照片数据', 'error'); }
+    // Auto-sync to IndexedDB after every write
+    IDB.sync();
   },
   getTournaments() { return this.get('tournaments'); },
   saveTournaments(d) { this.set('tournaments', d); },
@@ -612,6 +614,190 @@ const DB = {
   saveAnnouncements(d) { this.set('announcements', d); },
   getAdminPassword() { return this.get('adminPwd', 'admin123'); },
   saveAdminPassword(d) { this.set('adminPwd', d); }
+};
+
+// ============================================================
+// IndexedDB Database Layer (persistent, backup-capable)
+// ============================================================
+const IDB = {
+  _dbName: 'volley2_db',
+  _ver: 2,
+  _storeData: 'app_data',
+  _storeBackup: 'backups',
+  _db: null,
+  _syncTimer: null,
+  _autoBackupInterval: null,
+
+  async init() {
+    try {
+      this._db = await new Promise((resolve, reject) => {
+        const req = indexedDB.open(this._dbName, this._ver);
+        req.onupgradeneeded = (e) => {
+          const db = e.target.result;
+          if (!db.objectStoreNames.contains(this._storeData)) {
+            db.createObjectStore(this._storeData);
+          }
+          if (!db.objectStoreNames.contains(this._storeBackup)) {
+            const bs = db.createObjectStore(this._storeBackup, { keyPath: 'id' });
+            bs.createIndex('time', 'time');
+          }
+        };
+        req.onsuccess = (e) => resolve(e.target.result);
+        req.onerror = (e) => reject(e.target.error);
+      });
+      // Restore localStorage from IndexedDB if localStorage is empty
+      await this.restoreToLS();
+      // Start auto-backup every 5 minutes
+      this.startAutoBackup();
+    } catch(e) {
+      console.warn('IndexedDB not available, using localStorage only:', e);
+    }
+  },
+
+  _tx(store, mode) {
+    const tx = this._db.transaction(store, mode);
+    return tx.objectStore(store);
+  },
+
+  _promisify(req) {
+    return new Promise((resolve, reject) => {
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  },
+
+  // Save all localStorage data to IndexedDB
+  async sync() {
+    if (!this._db) return;
+    clearTimeout(this._syncTimer);
+    this._syncTimer = setTimeout(async () => {
+      try {
+        const keys = ['tournaments','registrations','schedules','scores','announcements','photoFolders','adminPwd'];
+        const store = this._tx(this._storeData, 'readwrite');
+        for (const k of keys) {
+          const raw = localStorage.getItem('vb_' + k);
+          store.put(raw ? JSON.parse(raw) : null, k);
+        }
+        store.put(Date.now(), '_lastSync');
+      } catch(e) { console.warn('IDB sync error:', e); }
+    }, 300);
+  },
+
+  // Restore localStorage from IndexedDB
+  async restoreToLS() {
+    if (!this._db) return;
+    try {
+      const store = this._tx(this._storeData, 'readonly');
+      const lastSync = await this._promisify(store.get('_lastSync'));
+      const lsTime = localStorage.getItem('vb__lsSyncTime');
+      // Only restore if IndexedDB is newer or localStorage is empty
+      if (lastSync && (!lsTime || lastSync > Number(lsTime))) {
+        const keys = ['tournaments','registrations','schedules','scores','announcements','photoFolders','adminPwd'];
+        let restored = false;
+        for (const k of keys) {
+          const data = await this._promisify(store.get(k));
+          if (data != null) {
+            localStorage.setItem('vb_' + k, JSON.stringify(data));
+            restored = true;
+          }
+        }
+        if (restored) localStorage.setItem('vb__lsSyncTime', String(lastSync));
+      }
+    } catch(e) { console.warn('IDB restore error:', e); }
+  },
+
+  // Create a timestamped backup snapshot
+  async createBackup(label) {
+    if (!this._db) return;
+    const id = genId();
+    const backup = {
+      id,
+      label: label || '',
+      time: Date.now(),
+      data: {
+        tournaments: DB.getTournaments(),
+        registrations: DB.getRegistrations(),
+        schedules: DB.getSchedules(),
+        scores: DB.getScores(),
+        announcements: DB.getAnnouncements(),
+        photoFolders: DB.getPhotoFolders(),
+        adminPwd: DB.getAdminPassword()
+      }
+    };
+    const store = this._tx(this._storeBackup, 'readwrite');
+    await this._promisify(store.add(backup));
+    return id;
+  },
+
+  // List all backups (newest first)
+  async getBackups() {
+    if (!this._db) return [];
+    const store = this._tx(this._storeBackup, 'readonly');
+    const all = await this._promisify(store.getAll());
+    return all.sort((a, b) => b.time - a.time);
+  },
+
+  // Restore from a backup
+  async restoreFromBackup(id) {
+    if (!this._db) return false;
+    const store = this._tx(this._storeBackup, 'readonly');
+    const backup = await this._promisify(store.get(id));
+    if (!backup || !backup.data) return false;
+    const d = backup.data;
+    if (d.tournaments != null) DB.saveTournaments(d.tournaments);
+    if (d.registrations != null) DB.saveRegistrations(d.registrations);
+    if (d.schedules != null) DB.saveSchedules(d.schedules);
+    if (d.scores != null) DB.saveScores(d.scores);
+    if (d.announcements != null) DB.saveAnnouncements(d.announcements);
+    if (d.photoFolders != null) DB.savePhotoFolders(d.photoFolders);
+    if (d.adminPwd != null) DB.saveAdminPassword(d.adminPwd);
+    return true;
+  },
+
+  // Delete a backup
+  async deleteBackup(id) {
+    if (!this._db) return;
+    const store = this._tx(this._storeBackup, 'readwrite');
+    await this._promisify(store.delete(id));
+  },
+
+  // Start auto-backup every 5 minutes
+  startAutoBackup() {
+    if (this._autoBackupInterval) clearInterval(this._autoBackupInterval);
+    this._autoBackupInterval = setInterval(async () => {
+      try {
+        // Only auto-backup if there's data
+        if (DB.getTournaments().length > 0 || DB.getRegistrations().length > 0 || DB.getSchedules().length > 0) {
+          await this.createBackup('自动备份');
+          // Keep only last 20 auto-backups
+          const backups = await this.getBackups();
+          const autoBackups = backups.filter(b => b.label === '自动备份');
+          if (autoBackups.length > 20) {
+            for (let i = 20; i < autoBackups.length; i++) {
+              await this.deleteBackup(autoBackups[i].id);
+            }
+          }
+        }
+      } catch(e) { console.warn('Auto-backup error:', e); }
+    }, 5 * 60 * 1000);
+  },
+
+  // Get storage size estimate
+  async getStorageInfo() {
+    if (!this._db) return { lsSize: 0, idbSize: 0, backupCount: 0 };
+    let lsSize = 0;
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('vb_')) lsSize += localStorage.getItem(k).length * 2; // UTF-16
+    }
+    const backups = await this.getBackups();
+    return {
+      lsSize,
+      idbSize: Math.round(lsSize * 1.1), // approximate
+      backupCount: backups.length,
+      lastSync: localStorage.getItem('vb__lsSyncTime') || '-'
+    };
+  }
 };
 
 // ID Generator
@@ -3131,14 +3317,21 @@ function renderBE_Settings() {
   let html = `<div class="section-header"><div class="section-title">系统设置</div></div>`;
 
   html += `<div class="card">
-    <div class="card-title">📦 数据迁移</div>
-    <p style="margin:10px 0;color:var(--text-secondary);font-size:13px">导出当前所有数据为JSON文件，或从JSON文件导入数据（用于跨设备/域名迁移）</p>
-    <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
-      <button class="btn btn-primary" onclick="exportAllData()">📤 导出全部数据</button>
-      <button class="btn btn-outline" onclick="document.getElementById('importDataFile').click()">📥 导入数据</button>
+    <div class="card-title">🗄️ 数据库管理</div>
+    <div id="dbStatus" style="margin:10px 0;font-size:13px;color:var(--text-secondary)">正在检测数据库状态...</div>
+    <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="createManualBackup()">💾 立即备份</button>
+      <button class="btn btn-outline" onclick="syncIDBNow()">🔄 同步到数据库</button>
+      <button class="btn btn-outline" onclick="exportAllData()">📤 导出JSON文件</button>
+      <button class="btn btn-outline" onclick="document.getElementById('importDataFile').click()">📥 导入JSON文件</button>
       <input type="file" id="importDataFile" accept=".json" style="display:none" onchange="importAllData(this)">
     </div>
-    <div style="margin-top:12px">
+  </div>`;
+
+  html += `<div class="card">
+    <div class="card-title">📋 备份记录</div>
+    <div id="backupList" style="margin:10px 0">加载中...</div>
+    <div style="margin-top:8px">
       <details style="cursor:pointer">
         <summary style="font-size:13px;color:var(--text-secondary)">从剪贴板粘贴导入</summary>
         <div style="margin-top:8px">
@@ -3161,6 +3354,21 @@ function renderBE_Settings() {
       <button class="btn btn-primary" onclick="changePassword()">修改密码</button>
     </div>
   </div>`;
+
+  // Load db info and backup list asynchronously
+  setTimeout(async () => {
+    try {
+      const info = await IDB.getStorageInfo();
+      const lsKB = (info.lsSize / 1024).toFixed(1);
+      document.getElementById('dbStatus').innerHTML =
+        `<span style="color:var(--success)">● 数据库已连接</span> &nbsp;|&nbsp; ` +
+        `本地缓存: ${lsKB} KB &nbsp;|&nbsp; 备份数: ${info.backupCount} &nbsp;|&nbsp; ` +
+        `上次同步: ${info.lastSync !== '-' ? new Date(Number(info.lastSync)).toLocaleString() : '从未'}`;
+    } catch(e) {
+      document.getElementById('dbStatus').innerHTML = '<span style="color:var(--danger)">● 数据库未连接，仅使用本地缓存</span>';
+    }
+    await loadBackupList();
+  }, 100);
 
   return html;
 }
@@ -3208,6 +3416,81 @@ function closeModal() {
 
 // DATA MIGRATION HELPERS
 // ============================================================
+async function loadBackupList() {
+  const el = document.getElementById('backupList');
+  if (!el) return;
+  try {
+    const backups = await IDB.getBackups();
+    if (!backups.length) {
+      el.innerHTML = '<p style="color:var(--text-secondary);font-size:13px">暂无备份记录</p>';
+      return;
+    }
+    let rows = backups.map(b => {
+      const t = new Date(b.time).toLocaleString();
+      const label = b.label ? `【${b.label}】` : '';
+      const count = (b.data ? (b.data.tournaments||[]).length + (b.data.registrations||[]).length + (b.data.schedules||[]).length : 0);
+      return `<tr>
+        <td style="padding:6px 10px;font-size:13px">${label}${t}</td>
+        <td style="padding:6px 10px;font-size:13px;color:var(--text-secondary)">${count} 条</td>
+        <td style="padding:6px 10px;text-align:right;white-space:nowrap">
+          <button class="btn btn-outline" style="padding:3px 10px;font-size:12px" onclick="restoreBackup('${b.id}')">恢复</button>
+          <button class="btn btn-outline" style="padding:3px 10px;font-size:12px;color:var(--danger)" onclick="deleteBackupRecord('${b.id}')">删除</button>
+        </td>
+      </tr>`;
+    }).join('');
+    el.innerHTML = `<table style="width:100%;border-collapse:collapse"><tbody>${rows}</tbody></table>`;
+  } catch(e) {
+    el.innerHTML = '<p style="color:var(--danger);font-size:13px">加载备份列表失败</p>';
+  }
+}
+
+async function createManualBackup() {
+  try {
+    await IDB.createBackup('手动备份');
+    toast('备份创建成功', 'success');
+    await loadBackupList();
+  } catch(e) { toast('备份失败: ' + e.message, 'error'); }
+}
+
+async function syncIDBNow() {
+  try {
+    await IDB.sync();
+    // Force immediate sync by clearing debounce
+    clearTimeout(IDB._syncTimer);
+    const keys = ['tournaments','registrations','schedules','scores','announcements','photoFolders','adminPwd'];
+    const store = IDB._tx(IDB._storeData, 'readwrite');
+    for (const k of keys) {
+      const raw = localStorage.getItem('vb_' + k);
+      store.put(raw ? JSON.parse(raw) : null, k);
+    }
+    store.put(Date.now(), '_lastSync');
+    localStorage.setItem('vb__lsSyncTime', String(Date.now()));
+    toast('同步完成', 'success');
+  } catch(e) { toast('同步失败: ' + e.message, 'error'); }
+}
+
+async function restoreBackup(id) {
+  if (!confirm('恢复此备份将覆盖当前所有数据，是否继续？')) return;
+  try {
+    const ok = await IDB.restoreFromBackup(id);
+    if (ok) {
+      toast('备份恢复成功，正在刷新...', 'success');
+      setTimeout(() => { currentTab = ''; renderApp(); }, 800);
+    } else {
+      toast('恢复失败，备份数据无效', 'error');
+    }
+  } catch(e) { toast('恢复失败: ' + e.message, 'error'); }
+}
+
+async function deleteBackupRecord(id) {
+  if (!confirm('确定删除此备份？')) return;
+  try {
+    await IDB.deleteBackup(id);
+    toast('备份已删除', 'success');
+    await loadBackupList();
+  } catch(e) { toast('删除失败: ' + e.message, 'error'); }
+}
+
 function exportAllData() {
   const data = {
     _version: 'v10',
@@ -3340,7 +3623,8 @@ function exportScoresXls() {
 // ============================================================
 // INIT
 // ============================================================
-(function init() {
+(async function init() {
+  await IDB.init();
   switchMode('frontend');
 })();
 </script>
