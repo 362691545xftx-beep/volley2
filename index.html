@@ -630,7 +630,7 @@ const IDB = {
 
   async init() {
     try {
-      this._db = await new Promise((resolve, reject) => {
+      const dbPromise = new Promise((resolve, reject) => {
         const req = indexedDB.open(this._dbName, this._ver);
         req.onupgradeneeded = (e) => {
           const db = e.target.result;
@@ -644,13 +644,19 @@ const IDB = {
         };
         req.onsuccess = (e) => resolve(e.target.result);
         req.onerror = (e) => reject(e.target.error);
+        req.onblocked = () => reject(new Error('IndexedDB blocked'));
       });
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('IndexedDB init timeout')), 5000)
+      );
+      this._db = await Promise.race([dbPromise, timeoutPromise]);
       // Restore localStorage from IndexedDB if localStorage is empty
       await this.restoreToLS();
       // Start auto-backup every 5 minutes
       this.startAutoBackup();
     } catch(e) {
       console.warn('IndexedDB not available, using localStorage only:', e);
+      this._db = null;
     }
   },
 
@@ -666,21 +672,38 @@ const IDB = {
     });
   },
 
-  // Save all localStorage data to IndexedDB
-  async sync() {
+  // Save all localStorage data to IndexedDB (debounced, fire-and-forget)
+  sync() {
     if (!this._db) return;
     clearTimeout(this._syncTimer);
-    this._syncTimer = setTimeout(async () => {
-      try {
-        const keys = ['tournaments','registrations','schedules','scores','announcements','photoFolders','adminPwd'];
-        const store = this._tx(this._storeData, 'readwrite');
-        for (const k of keys) {
-          const raw = localStorage.getItem('vb_' + k);
-          store.put(raw ? JSON.parse(raw) : null, k);
-        }
-        store.put(Date.now(), '_lastSync');
-      } catch(e) { console.warn('IDB sync error:', e); }
+    this._syncTimer = setTimeout(() => {
+      this._doSync().catch(e => console.warn('IDB auto-sync error:', e));
     }, 300);
+  },
+
+  // Internal: perform actual sync
+  async _doSync() {
+    if (!this._db) return;
+    const keys = ['tournaments','registrations','schedules','scores','announcements','photoFolders','adminPwd'];
+    const tx = this._db.transaction(this._storeData, 'readwrite');
+    const store = tx.objectStore(this._storeData);
+    for (const k of keys) {
+      const raw = localStorage.getItem('vb_' + k);
+      store.put(raw ? JSON.parse(raw) : null, k);
+    }
+    store.put(Date.now(), '_lastSync');
+    await new Promise((resolve, reject) => {
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+    localStorage.setItem('vb__lsSyncTime', String(Date.now()));
+  },
+
+  // Force immediate sync and return a Promise
+  async syncNow() {
+    if (!this._db) return;
+    clearTimeout(this._syncTimer);
+    return this._doSync();
   },
 
   // Restore localStorage from IndexedDB
@@ -3454,17 +3477,7 @@ async function createManualBackup() {
 
 async function syncIDBNow() {
   try {
-    await IDB.sync();
-    // Force immediate sync by clearing debounce
-    clearTimeout(IDB._syncTimer);
-    const keys = ['tournaments','registrations','schedules','scores','announcements','photoFolders','adminPwd'];
-    const store = IDB._tx(IDB._storeData, 'readwrite');
-    for (const k of keys) {
-      const raw = localStorage.getItem('vb_' + k);
-      store.put(raw ? JSON.parse(raw) : null, k);
-    }
-    store.put(Date.now(), '_lastSync');
-    localStorage.setItem('vb__lsSyncTime', String(Date.now()));
+    await IDB.syncNow();
     toast('同步完成', 'success');
   } catch(e) { toast('同步失败: ' + e.message, 'error'); }
 }
@@ -3474,8 +3487,9 @@ async function restoreBackup(id) {
   try {
     const ok = await IDB.restoreFromBackup(id);
     if (ok) {
+      await IDB.syncNow();
       toast('备份恢复成功，正在刷新...', 'success');
-      setTimeout(() => { currentTab = ''; renderApp(); }, 800);
+      setTimeout(() => { location.reload(); }, 600);
     } else {
       toast('恢复失败，备份数据无效', 'error');
     }
@@ -3514,7 +3528,7 @@ function exportAllData() {
   toast('数据导出成功', 'success');
 }
 
-function _doImportData(data) {
+async function _doImportData(data) {
   if (!data || !data._version) {
     toast('数据格式无效，请检查文件内容', 'error');
     return;
@@ -3529,18 +3543,19 @@ function _doImportData(data) {
   if (data.announcements) DB.saveAnnouncements(data.announcements);
   if (data.photoFolders) DB.savePhotoFolders(data.photoFolders);
   if (data.adminPwd) DB.saveAdminPassword(data.adminPwd);
+  await IDB.syncNow();
   toast('数据导入成功，正在刷新...', 'success');
-  setTimeout(() => { currentTab = ''; renderApp(); }, 800);
+  setTimeout(() => { location.reload(); }, 600);
 }
 
 function importAllData(input) {
   const file = input.files[0];
   if (!file) return;
   const reader = new FileReader();
-  reader.onload = function(e) {
+  reader.onload = async function(e) {
     try {
       const data = JSON.parse(e.target.result);
-      _doImportData(data);
+      await _doImportData(data);
     } catch(err) {
       toast('文件解析失败: ' + err.message, 'error');
     }
@@ -3549,12 +3564,12 @@ function importAllData(input) {
   input.value = '';
 }
 
-function importAllDataFromText() {
+async function importAllDataFromText() {
   const text = document.getElementById('importDataText').value.trim();
   if (!text) { toast('请粘贴JSON数据', 'warning'); return; }
   try {
     const data = JSON.parse(text);
-    _doImportData(data);
+    await _doImportData(data);
   } catch(err) {
     toast('数据解析失败: ' + err.message, 'error');
   }
