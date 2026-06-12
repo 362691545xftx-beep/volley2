@@ -3131,6 +3131,25 @@ function renderBE_Settings() {
   let html = `<div class="section-header"><div class="section-title">系统设置</div></div>`;
 
   html += `<div class="card">
+    <div class="card-title">📦 数据迁移</div>
+    <p style="margin:10px 0;color:var(--text-secondary);font-size:13px">导出当前所有数据为JSON文件，或从JSON文件导入数据（用于跨设备/域名迁移）</p>
+    <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="exportAllData()">📤 导出全部数据</button>
+      <button class="btn btn-outline" onclick="document.getElementById('importDataFile').click()">📥 导入数据</button>
+      <input type="file" id="importDataFile" accept=".json" style="display:none" onchange="importAllData(this)">
+    </div>
+    <div style="margin-top:12px">
+      <details style="cursor:pointer">
+        <summary style="font-size:13px;color:var(--text-secondary)">从剪贴板粘贴导入</summary>
+        <div style="margin-top:8px">
+          <textarea id="importDataText" class="form-input" rows="4" placeholder="粘贴导出的JSON数据..." style="font-size:12px;resize:vertical"></textarea>
+          <button class="btn btn-outline" style="margin-top:6px" onclick="importAllDataFromText()">📥 从文本导入</button>
+        </div>
+      </details>
+    </div>
+  </div>`;
+
+  html += `<div class="card">
     <div class="card-title">🔑 修改管理密码</div>
     <div style="margin-top:14px">
       <div class="form-group"><label class="form-label">当前密码</label>
@@ -3185,6 +3204,77 @@ function showModal(title, body, onConfirm, hideConfirm = false) {
 
 function closeModal() {
   document.getElementById('genericModal').classList.remove('active');
+}
+
+// DATA MIGRATION HELPERS
+// ============================================================
+function exportAllData() {
+  const data = {
+    _version: 'v10',
+    _exportTime: new Date().toISOString(),
+    tournaments: DB.getTournaments(),
+    registrations: DB.getRegistrations(),
+    schedules: DB.getSchedules(),
+    scores: DB.getScores(),
+    announcements: DB.getAnnouncements(),
+    photoFolders: DB.getPhotoFolders(),
+    adminPwd: DB.getAdminPassword()
+  };
+  const json = JSON.stringify(data, null, 2);
+  const blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'volley2_data_' + new Date().toISOString().slice(0, 10) + '.json';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast('数据导出成功', 'success');
+}
+
+function _doImportData(data) {
+  if (!data || !data._version) {
+    toast('数据格式无效，请检查文件内容', 'error');
+    return;
+  }
+  const total = (data.tournaments||[]).length + (data.registrations||[]).length +
+                (data.schedules||[]).length + (data.announcements||[]).length;
+  if (!confirm('即将导入数据，共 ' + total + ' 条记录。\n\n选择"确定"：覆盖当前所有数据\n选择"取消"：取消导入')) return;
+  if (data.tournaments) DB.saveTournaments(data.tournaments);
+  if (data.registrations) DB.saveRegistrations(data.registrations);
+  if (data.schedules) DB.saveSchedules(data.schedules);
+  if (data.scores) DB.saveScores(data.scores);
+  if (data.announcements) DB.saveAnnouncements(data.announcements);
+  if (data.photoFolders) DB.savePhotoFolders(data.photoFolders);
+  if (data.adminPwd) DB.saveAdminPassword(data.adminPwd);
+  toast('数据导入成功，正在刷新...', 'success');
+  setTimeout(() => { currentTab = ''; renderApp(); }, 800);
+}
+
+function importAllData(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      const data = JSON.parse(e.target.result);
+      _doImportData(data);
+    } catch(err) {
+      toast('文件解析失败: ' + err.message, 'error');
+    }
+  };
+  reader.readAsText(file);
+  input.value = '';
+}
+
+function importAllDataFromText() {
+  const text = document.getElementById('importDataText').value.trim();
+  if (!text) { toast('请粘贴JSON数据', 'warning'); return; }
+  try {
+    const data = JSON.parse(text);
+    _doImportData(data);
+  } catch(err) {
+    toast('数据解析失败: ' + err.message, 'error');
+  }
 }
 
 // ============================================================
