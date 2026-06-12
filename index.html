@@ -842,10 +842,16 @@ const IDB = {
 // ============================================================
 // Cloud Sync Layer (Supabase REST API + Realtime)
 // ============================================================
+// ========== Supabase 配置（硬编码，所有访客打开页面即自动连接云端） ==========
+const SUPABASE_URL = 'https://hqzyebjpazaircvymxp.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_I8BqJK0wQFMRqZ6oeHSYWw_e0wpxrz4';
+// 管理员可在后台「系统设置 → 云端同步」中覆盖以上默认值
+// ===================================================================================
+
 let supabaseClient = null;
 
 function initSupabase(url, key) {
-  if (supabaseClient) return;
+  // 允许重新初始化（管理员在后台更改配置时）
   try {
     supabaseClient = window.supabase.createClient(url, key, {
       realtime: { params: { eventsPerSecond: 2 } }
@@ -868,11 +874,18 @@ const Cloud = {
   _pollTimer: null,
 
   init() {
-    this._url = localStorage.getItem('vb_cloudUrl') || '';
-    this._key = localStorage.getItem('vb_cloudKey') || '';
+    // 优先使用 localStorage（管理员可能已在后台覆盖配置），否则使用硬编码默认值
+    const defaultUrl = (typeof SUPABASE_URL !== 'undefined' && SUPABASE_URL.indexOf('请替换') === -1) ? SUPABASE_URL : '';
+    const defaultKey = (typeof SUPABASE_ANON_KEY !== 'undefined' && SUPABASE_ANON_KEY.indexOf('请替换') === -1) ? SUPABASE_ANON_KEY : '';
+    // 注意：localStorage.getItem 返回 null 表示"从未保存过"（用默认值），返回 "" 表示"用户清除了配置"（禁用云端）
+    const savedUrl = localStorage.getItem('vb_cloudUrl');
+    const savedKey = localStorage.getItem('vb_cloudKey');
+    this._url = (savedUrl !== null) ? savedUrl : defaultUrl;
+    this._key = (savedKey !== null) ? savedKey : defaultKey;
     this._deviceId = localStorage.getItem('vb_deviceId') || this._generateDeviceId();
     this._enabled = !!(this._url && this._key);
     this._updateStatusUI();
+    console.log('[Cloud] init: enabled=' + this._enabled + ', url=' + (this._url ? this._url.slice(0, 30) + '...' : 'empty'));
   },
 
   _generateDeviceId() {
@@ -4111,30 +4124,28 @@ function exportScoresXls() {
 (async function init() {
   await IDB.init();
   Cloud.init();
-  // If cloud is configured, set up real-time sync
-  if (Cloud.isConfigured()) {
+  // 总是尝试初始化 Supabase（使用硬编码默认值或 localStorage 中的配置）
+  if (Cloud._url && Cloud._key) {
     initSupabase(Cloud._url, Cloud._key);
-    // 1. Pull latest data from cloud (non-blocking)
-    setTimeout(async () => {
-      try {
-        const result = await Cloud.pull();
-        if (result && result.data) {
-          const localHasData = DB.getTournaments().length > 0 || DB.getRegistrations().length > 0;
-          const cloudHasData = (result.data.tournaments||[]).length > 0 || (result.data.registrations||[]).length > 0;
-          if (cloudHasData && !localHasData) {
-            // Auto-apply cloud data if local is empty
-            Cloud._applyCloudData(result.data);
-            await IDB.syncNow();
-            toast('已从云端自动同步数据', 'success');
-            renderCurrentTab();
-          }
-        }
-      } catch(e) { console.warn('[Cloud] Auto-pull skipped:', e.message); }
-      // 2. Subscribe to Realtime for cross-device sync
-      Cloud.subscribe();
-      // 3. Push local data to ensure cloud is up to date
-      Cloud.autoPush();
-    }, 2000);
+  }
+  // 如果云端配置可用，自动同步
+  if (Cloud.isConfigured()) {
+    // 1. 立即从云端拉取最新数据
+    try {
+      const result = await Cloud.pull();
+      if (result && result.data) {
+        Cloud._applyCloudData(result.data);
+        await IDB.syncNow();
+        console.log('[Cloud] 初始拉取成功，云端数据已同步');
+        renderCurrentTab();
+      }
+    } catch(e) { console.warn('[Cloud] 初始拉取失败:', e.message); }
+    // 2. 订阅 Realtime，实现多终端实时更新
+    Cloud.subscribe();
+    // 3. 启动自动推送（管理员在后台操作时会自动推送到云端）
+    Cloud.autoPush();
+  } else {
+    console.log('[Cloud] 未检测到云端配置，以离线模式运行');
   }
   switchMode('frontend');
 })();
