@@ -6,7 +6,14 @@
   "scripts": {
     "start": "npx serve ."
   },
-  "keywords": ["volleyball", "sports", "management"],
+  "keywords": [
+    "volleyball",
+    "sports",
+    "management"
+  ],
   "author": "",
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "vercel": "^54.12.2"
+  }
 }
