@@ -1,0 +1,12 @@
+{
+  "name": "volley2",
+  "version": "1.0.0",
+  "description": "气排球竞赛管理系统",
+  "main": "index.html",
+  "scripts": {
+    "start": "npx serve ."
+  },
+  "keywords": ["volleyball", "sports", "management"],
+  "author": "",
+  "license": "MIT"
+}
